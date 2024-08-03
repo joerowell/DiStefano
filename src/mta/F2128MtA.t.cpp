@@ -4,6 +4,7 @@
 #define SOCKET_SETUP
 #include "../ssl/TestUtil.hpp"
 
+#include "BatchedAdditive.hpp"
 #include "F2128MtA.hpp"
 
 //! [F2128MtAGenerateGadgetR]
@@ -713,6 +714,103 @@ TEST_CASE("do_batched_ot") {
   emp::block running = emp::makeBlock(0, 1);
   emp::block share;
 
+  // Check the shares for h, h^2, h^3, ...
+  for (unsigned i = 0; i < 1024; i++) {
+    // Check that the shares add up.
+    running = F2128_MTA::mul(running, total_secret);
+    share = verifier_share[i] ^ prover_share[i];
+    CHECK(emp::cmpBlock(&share, &running, 1));
+  }
+}
+
+TEST_CASE("generate_indices") {
+  const auto arr = BatchedAdditive::generate_batch();
+  for (auto v : arr.iter_pos) {
+    CHECK(v != -1);
+    // This is something we've tested statically
+    CHECK(v <= 4);
+  }
+
+  for (auto v : arr.pairs) {
+    CHECK(v.first < 1024);
+    CHECK(v.second < 1024);
+    CHECK(v.first >= 0);
+    CHECK(v.second >= 0);
+  }
+}
+
+static constexpr bool check_indices_gt_0() {
+  constexpr auto val = BatchedAdditive::generate_batch();
+  for (auto v : val.iter_pos) {
+    if (v < 0) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static_assert(check_indices_gt_0(), "Err: indices contains negative value!");
+static_assert(BatchedAdditive::number_of_unique_inputs<0>() == 1);
+static_assert(BatchedAdditive::number_of_unique_outputs<0>() == 1);
+static_assert(BatchedAdditive::number_of_unique_inputs<1>() == 10);
+
+TEST_CASE("number_of_unique_inputs") {
+  constexpr auto batch = BatchedAdditive::generate_batch();
+  REQUIRE(batch.iter_pos[2] == 1);
+  REQUIRE(batch.pairs[2].first == 1);
+  REQUIRE(batch.pairs[2].second == 2);
+  constexpr auto inps = BatchedAdditive::get_inputs_used<1, true>();
+  CHECK(inps[1] == 1);
+  CHECK(inps[2] == 1);
+}
+
+TEST_CASE("do_batched_ot_additive_batched") {
+  if constexpr (F2128_MTA::use_multiplicative_shares ||
+                !F2128_MTA::use_additive_batching) {
+    return;
+  }
+
+  auto context = CreateContextWithTestCertificate(TLS_method());
+  REQUIRE(context);
+  std::unique_ptr<TLSSocket> client, server;
+  REQUIRE(setup_sockets(context, server, client));
+  EmpWrapper<> s_wrapper{server->get_ssl_object()};
+  EmpWrapper<> c_wrapper{client->get_ssl_object()};
+
+  emp::IKNP<EmpWrapper<>> sender_ot{&s_wrapper, true};
+  emp::IKNP<EmpWrapper<>> receiver_ot{&c_wrapper, true};
+
+  // Generate the random values.
+  emp::block alpha, beta;
+  Util::generate_random_bytes<sizeof(alpha)>(&alpha);
+  Util::generate_random_bytes<sizeof(beta)>(&beta);
+
+  F2128_MTA::ShareType verifier_share, prover_share;
+  uint64_t verif_band{}, prover_band{};
+
+  SUBCASE("native") {
+    auto verifier_work = [&]() {
+      verifier_share = F2128_MTA::generate_shares_verifier_batched(
+          sender_ot, *server->get_ssl_object(), alpha, verif_band);
+    };
+
+    std::thread verifier(verifier_work);
+    prover_share = F2128_MTA::generate_shares_prover_batched(
+        receiver_ot, *client->get_ssl_object(), beta, prover_band);
+    verifier.join();
+  }
+
+  // If we're using multiplicative secrets then we need to change how we treat
+  // the starting share. The rest is the same though.
+  emp::block total_secret = alpha ^ beta;
+  emp::block running = emp::makeBlock(0, 1);
+  emp::block share;
+
+  constexpr auto outputs = BatchedAdditive::number_of_unique_outputs<1>() +
+                           BatchedAdditive::number_of_unique_outputs<2>() +
+                           BatchedAdditive::number_of_unique_outputs<3>() +
+                           BatchedAdditive::number_of_unique_outputs<4>();
+  std::cerr << "Number of outputs in total: " << outputs << std::endl;
   // Check the shares for h, h^2, h^3, ...
   for (unsigned i = 0; i < 1024; i++) {
     // Check that the shares add up.

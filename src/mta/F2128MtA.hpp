@@ -4,6 +4,7 @@
 #include "../emp-ot/emp-ot/emp-ot.h"
 #include "../ssl/EmpWrapper.hpp"
 #include "../ssl/Util.hpp"
+#include "BatchedAdditive.hpp"
 #include "EmpBlockSpan.hpp"
 #include <array>
 #include <cstdint>
@@ -65,7 +66,22 @@ inline constexpr bool use_ferret = false;
      the input shares to be multiplicative shares of `h`. If this is false,
      the batched OT assumes additive shares of `h`. This is an optimisation.
 **/
-inline constexpr bool use_multiplicative_shares = true;
+inline constexpr bool use_multiplicative_shares = false;
+
+/**
+   use_additive_batching. If this is true, then the batched OT expects the input
+   shares to be additive shares of `h`, and we batch the multiplications to
+ amortise the cost slightly. If this is false, then the batched OT's behaviour
+ changes depending on if use_multiplicative_shares is false or not.
+ **/
+
+inline constexpr bool use_additive_batching = true;
+
+// if use_multiplicatives_shares is set, then use_additive_batching must be
+// false i.e use_multiplicative_shares -> use_additive_batching. If
+// use_multiplicative_shares is false, then it's fine either way.
+static_assert(!(use_multiplicative_shares && use_additive_batching),
+              "Error: cannot use additive batching with multiplicative shares");
 
 /**
    k. k is the dimension of the field.
@@ -856,6 +872,13 @@ public:
   void compute_mult_shares(SSL &ssl, ShareType &out,
                            F &&compute_share_of) noexcept;
 
+  // Used to compute shares of multiple powers in a single iteration. Used with
+  // additive shares
+  template <unsigned iter, typename F>
+  void compute_additive_shares_batched(SSL &ssl, F2128_MTA::ShareType &shares,
+                                       F &&compute_share_of,
+                                       unsigned &used) noexcept;
+
 private:
   BetaType beta;
   BType b;
@@ -882,6 +905,13 @@ public:
   template <typename F>
   void compute_mult_shares(SSL &ssl, ShareType &out,
                            F &&compute_share_of) noexcept;
+
+  // Used to compute shares of multiple powers in a single iteration. Used with
+  // additive shares
+  template <unsigned iter, typename F>
+  void compute_additive_shares_batched(SSL &ssl, F2128_MTA::ShareType &shares,
+                                       F &&compute_share_of,
+                                       unsigned &used) noexcept;
 
 private:
   std::unique_ptr<AType> a_tilde;
@@ -983,6 +1013,14 @@ returning the result. This function does not throw.
 inline ShareType
 generate_shares_verifier_batched(SSL &ssl, const std::array<uint8_t, 16> &in,
                                  uint64_t &bandwidth) noexcept;
+
+template <unsigned iter_count, typename DataType, typename F>
+inline void
+generate_additive_shares_batched_helper(DataType &data, SSL &ssl,
+                                        F2128_MTA::ShareType &shares,
+                                        F &&compute_share_of, unsigned &used);
+
+constexpr inline void compute_squares(ShareType &shares, const unsigned start);
 
 } // namespace F2128_MTA
 

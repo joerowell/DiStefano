@@ -698,6 +698,17 @@ bool F2128_MTA::single_iter(OTType &socket, SSL &ssl, const emp::block in,
   return true;
 }
 
+constexpr void F2128_MTA::compute_squares(F2128_MTA::ShareType &shares,
+                                          const unsigned start) {
+  unsigned lhs = start * 2 + 1;
+  unsigned rhs = start;
+  while (lhs < 1024) {
+    shares[lhs] = F2128_MTA::mul(shares[rhs], shares[rhs]);
+    rhs = lhs;
+    lhs = lhs * 2 + 1;
+  }
+}
+
 template <bool is_verifier, typename OTType>
 F2128_MTA::ShareType
 F2128_MTA::generate_shares_repeated(OTType &socket, SSL &ssl,
@@ -734,18 +745,8 @@ F2128_MTA::generate_shares_repeated(OTType &socket, SSL &ssl,
   // h^1.
   out[0] = in;
 
-  auto compute_squares = [&](const unsigned start) {
-    unsigned lhs = start * 2 + 1;
-    unsigned rhs = start;
-    while (lhs < 1024) {
-      out[lhs] = mul(out[rhs], out[rhs]);
-      rhs = lhs;
-      lhs = lhs * 2 + 1;
-    }
-  };
-
   // Now we can generate the squared powers 2,4,8,...
-  compute_squares(0);
+  compute_squares(out, 0);
 
   // Now we want to compute the shared terms.
   // We do this iteratively.
@@ -773,7 +774,7 @@ F2128_MTA::generate_shares_repeated(OTType &socket, SSL &ssl,
 
     // out[i] is just the share + the existing multiple.
     out[i] = our_share ^ first_out ^ second_out;
-    compute_squares(i);
+    compute_squares(out, i);
   }
 
   return out;
@@ -872,6 +873,59 @@ emp::block F2128_MTA::ReceiverType::compute_share(
          compute_share_of(b[i - 1], other_tmp[1], i - 1, *t_b);
 }
 
+template <unsigned iter, typename F>
+void F2128_MTA::ReceiverType::compute_additive_shares_batched(
+    SSL &ssl, F2128_MTA::ShareType &shares, F &&compute_share_of,
+    unsigned &used) noexcept {
+  static_assert(iter > 0, "Err: iter must be greater than 0");
+  constexpr auto number_of_unique_outputs =
+      BatchedAdditive::number_of_unique_outputs<iter>();
+  using InputType = emp::block[2 * number_of_unique_outputs];
+
+  // N.B this "new" actually uses operator new[] i.e. we need to delete with
+  // delete[]
+  auto *in_arr = new InputType();
+  auto *out_arr = new InputType();
+
+  constexpr auto input_pairs = BatchedAdditive::generate_batch().pairs;
+  constexpr auto unique_outputs =
+      BatchedAdditive::template get_unique_outputs<iter>();
+
+  unsigned pos{};
+  for (const auto v : unique_outputs) {
+    // Input pair is input_pairs[v].first, input_pairs[v].second
+    const auto first =
+        static_cast<unsigned>(input_pairs[static_cast<unsigned>(v)].first);
+    const auto second =
+        static_cast<unsigned>(input_pairs[static_cast<unsigned>(v)].second);
+    out_arr[pos] = b[pos + used] ^ shares[second];
+    out_arr[pos + 1] = b[pos + used + 1] ^ shares[first];
+    pos += 2;
+  }
+
+  assert(pos == 2 * unique_outputs.size());
+
+  Util::process_data(&ssl, reinterpret_cast<char *>(in_arr), sizeof(InputType),
+                     SSL_read);
+  Util::process_data(&ssl, reinterpret_cast<char *>(out_arr), sizeof(InputType),
+                     SSL_write);
+
+  for (unsigned i = 0; i < 2 * unique_outputs.size(); i += 2) {
+    const auto v = static_cast<unsigned>(unique_outputs[i / 2]);
+    const auto first = static_cast<unsigned>(input_pairs[v].first);
+    const auto second = static_cast<unsigned>(input_pairs[v].second);
+
+    shares[v] =
+        F2128_MTA::mul(shares[first], shares[second]) ^
+        compute_share_of(b[used + i], in_arr[i], used + i, *t_b) ^
+        compute_share_of(b[used + i + 1], in_arr[i + 1], used + i + 1, *t_b);
+  }
+
+  used += pos;
+  delete[] in_arr;
+  delete[] out_arr;
+}
+
 template <typename F>
 emp::block F2128_MTA::SenderType::compute_share(SSL &ssl, const unsigned i,
                                                 const emp::block in,
@@ -883,8 +937,64 @@ emp::block F2128_MTA::SenderType::compute_share(SSL &ssl, const unsigned i,
   SSL_write(&ssl, &my_tmp, sizeof(my_tmp));
   SSL_read(&ssl, &other_tmp, sizeof(other_tmp));
 
-  return mul(other_in, in) ^ compute_share_of(in, other_tmp[0], i - 2, *t_a) ^
+  return F2128_MTA::mul(other_in, in) ^
+         compute_share_of(in, other_tmp[0], i - 2, *t_a) ^
          compute_share_of(other_in, other_tmp[1], i - 1, *t_a);
+}
+
+template <unsigned iter, typename F>
+void F2128_MTA::SenderType::compute_additive_shares_batched(
+    SSL &ssl, F2128_MTA::ShareType &shares, F &&compute_share_of,
+    unsigned &used) noexcept {
+
+  static_assert(iter > 0, "Err: iter must be greater than 0");
+  constexpr auto number_of_unique_outputs =
+      BatchedAdditive::number_of_unique_outputs<iter>();
+
+  using InputType = emp::block[2 * number_of_unique_outputs];
+
+  // N.B this "new" actually uses operator new[] i.e. we need to delete with
+  // delete[]
+  auto *in_arr = new InputType();
+  auto *out_arr = new InputType();
+
+  constexpr auto input_pairs = BatchedAdditive::generate_batch().pairs;
+  constexpr auto unique_outputs =
+      BatchedAdditive::template get_unique_outputs<iter>();
+
+  unsigned pos{};
+  for (const auto v : unique_outputs) {
+    // Input pair is input_pairs[v].first, input_pairs[v].second
+    const auto first =
+        static_cast<unsigned>(input_pairs[static_cast<unsigned>(v)].first);
+    const auto second =
+        static_cast<unsigned>(input_pairs[static_cast<unsigned>(v)].second);
+    out_arr[pos] = (*a_tilde)[pos + used] ^ shares[first];
+    out_arr[pos + 1] = (*a_tilde)[pos + used + 1] ^ shares[second];
+    pos += 2;
+  }
+
+  assert(pos == 2 * unique_outputs.size());
+
+  Util::process_data(&ssl, reinterpret_cast<char *>(out_arr), sizeof(InputType),
+                     SSL_write);
+  Util::process_data(&ssl, reinterpret_cast<char *>(in_arr), sizeof(InputType),
+                     SSL_read);
+
+  for (unsigned i = 0; i < 2 * unique_outputs.size(); i += 2) {
+    const auto v = static_cast<unsigned>(unique_outputs[i / 2]);
+    const auto first = static_cast<unsigned>(input_pairs[v].first);
+    const auto second = static_cast<unsigned>(input_pairs[v].second);
+
+    shares[v] =
+        F2128_MTA::mul(shares[first], shares[second]) ^
+        compute_share_of(shares[first], in_arr[i], used + i, *t_a) ^
+        compute_share_of(shares[second], in_arr[i + 1], used + i + 1, *t_a);
+  }
+
+  used += pos;
+  delete[] in_arr;
+  delete[] out_arr;
 }
 
 template <typename F>
@@ -960,8 +1070,10 @@ F2128_MTA::generate_shares_batched(OTType &socket, SSL &ssl,
   // secrets are used, then `h` is shared as p_in * v_in. By contrast, if
   // additive secrets are used, then `h` = `p_in ^ v_in`. For this documentation
   // we will consider the vernacular of the prover (i.e in = p_in). For additive
-  // shares, we use the TLSNotary protocol. Namely, we: 1) Compute shares of all
-  // power of two shares locally by simply computing in^2, in^4, ...
+  // shares, we use the TLSNotary protocol.
+  // Namely, we:
+  // 1) Compute shares of all power of two shares locally by simply computing
+  // in^2, in^4, ...
   //    by using the identity that h^2 = (p_in + v_in) ^2 = p_in^2 + v_in^2
   //    (over binary fields).
   // 2) We can  also compute a portion of the odd shares locally too. Indeed,
@@ -993,17 +1105,6 @@ F2128_MTA::generate_shares_batched(OTType &socket, SSL &ssl,
   // Note: we have an off-by-one here. The element at 0 is actually a share of
   // h^1.
   out[0] = in;
-
-  // This will be useful later.
-  auto compute_squares = [&](const unsigned start) {
-    unsigned lhs = start * 2 + 1;
-    unsigned rhs = start;
-    while (lhs < 1024) {
-      out[lhs] = mul(out[rhs], out[rhs]);
-      rhs = lhs;
-      lhs = lhs * 2 + 1;
-    }
-  };
 
   // Now we want to compute the shared terms.
   // As per usual, we do different work depending on if we're the verifier
@@ -1068,25 +1169,58 @@ F2128_MTA::generate_shares_batched(OTType &socket, SSL &ssl,
     data.compute_mult_shares(ssl, out, compute_share_of);
     // N.B we need to do the initial squares 2, 4, 8... etc here too.
     for (unsigned i = 0; i < 1024; i += 2) {
-      compute_squares(i);
+      F2128_MTA::compute_squares(out, i);
     }
 
   } else {
     // Compute the powers 2, 4, 8, ...
-    compute_squares(0);
+    F2128_MTA::compute_squares(out, 0);
 
-    // Now we can produce the values that we are going to send. Sadly we have
-    // to do this one-by-one, which is suboptimal (we require the previous
-    // output to make the next power up).
-    for (unsigned i = 2; i < 1024; i += 2) {
-      out[i] = data.compute_share(ssl, i, in, out[i - 1], compute_share_of);
-      compute_squares(i);
+    if constexpr (!use_additive_batching) {
+      // Now we can produce the values that we are going to send. Sadly we have
+      // to do this one-by-one, which is suboptimal (we require the previous
+      // output to make the next power up).
+      for (unsigned i = 2; i < 1024; i += 2) {
+        out[i] = data.compute_share(ssl, i, in, out[i - 1], compute_share_of);
+        F2128_MTA::compute_squares(out, i);
+      }
+    } else {
+      // Use the additive batching approach.
+      // The idea here is as follows. Notice that after the first iteration we
+      // have the powers h^1, h^2, h^4, h^8, ..., h^1024 computed. We can
+      // greedily recombine these powers and compute e.g h^3 fully by computing
+      // h^2 \cdot h = (h_p^2 + h_v^2) * (h_p + h_v). In fact, we can also
+      // compute h^5, and h^9, ... etc in this way. But, we can also compute h^6
+      // = h^4 * h^2 in a similar fashion.
+      // Thus, we'll (at compile-time) make the decisions on the number of
+      // generations that we're going to run, and then specialise accordingly.
+      // Note that the amount of data sent in each step is somewhat different,
+      // but it should be OK in either case.
+      unsigned used{};
+      F2128_MTA::generate_additive_shares_batched_helper<1>(
+          data, ssl, out, compute_share_of, used);
     }
   }
 
   // In any case, we've used this much data during the OTs.
   bandwidth += sizeof(emp::block) * F2128_MTA::l;
   return out;
+}
+
+template <unsigned iter_count, typename DataType, typename F>
+inline void F2128_MTA::generate_additive_shares_batched_helper(
+    DataType &data, SSL &ssl, F2128_MTA::ShareType &shares,
+    F &&compute_share_of, unsigned &used) {
+  constexpr auto max_iter_count = BatchedAdditive::max_value_in_batch();
+  if constexpr (iter_count <= max_iter_count) {
+    data.template compute_additive_shares_batched<iter_count>(
+        ssl, shares, compute_share_of, used);
+    for (const auto v : BatchedAdditive::get_unique_outputs<iter_count>()) {
+      compute_squares(shares, static_cast<unsigned>(v));
+    }
+    generate_additive_shares_batched_helper<iter_count + 1>(
+        data, ssl, shares, compute_share_of, used);
+  }
 }
 
 template <typename OTType>

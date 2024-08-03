@@ -76,8 +76,11 @@ set(WARNINGS
     -Wnon-virtual-dtor
     -Wunused
     # These are omitted just so that we can continue piecewise developing.
-    -Wno-error=unused-parameter    
+    -Wno-error=unused-parameter
+    -Wno-error=zero-as-null-pointer-constant
+    -Wno-error=unused-variable
     -Wno-error=return-type
+    -Wno-error=unused-function
     -Woverloaded-virtual
     -Wsign-conversion
     -Wconversion
@@ -89,7 +92,8 @@ set(WARNINGS
     -Wformat=2
     -Wcast-qual
     -Wmissing-declarations
-    -Wsign-promo)
+    -Wsign-promo
+    -Wno-error=disabled-optimization)
 
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -127,7 +131,7 @@ endif()
 # this is primarily to make sure that we aren't violating any standard library assumptions.
 # This comes at a pretty big performance cost though.
 
-set(G_C_DEBUG_FLAGS "-ggdb -fno-omit-frame-pointer -fstack-protector-all" "${WARNINGS}")
+set(G_C_DEBUG_FLAGS "-ggdb -fno-omit-frame-pointer -fstack-protector-all -fconstexpr-ops-limit=100000000" "${WARNINGS}")
 set(G_C_DEBUG_ASAN_FLAGS "-ggdb -D_GLIBCXX_DEBUG -fno-omit-frame-pointer -fstack-protector-all" "${LIB_ASAN}" "${WARNINGS}")
 set(G_C_OPT_FLAGS "-ggdb -fno-omit-frame-pointer -Ofast -DNDEBUG" "${WARNINGS}")
 
@@ -183,6 +187,9 @@ set(SRC_FILES
   ssl/Messaging.cpp
   ssl/EmpWrapper.cpp
   ssl/EmpWrapperAG2PC.cpp
+  ssl/EmpSSLSocketManager.cpp
+  ssl/ThreadSafeSSL.cpp
+  ssl/EmpThreadSocket.cpp
   ssl/SSLBuffer.cpp
   ssl/CounterType.cpp
   ssl/NoBuffer.cpp
@@ -216,7 +223,7 @@ target_link_libraries(TLSAttestDebugAsan PRIVATE ${L_ASAN_FLAGS})
 target_compile_options(TLSAttestOpt PRIVATE ${C_OPT_FLAGS})
 target_link_libraries(TLSAttestOpt PRIVATE ${L_FLAGS})
 
-set(SSLTARGETS Util EmpWrapper EmpWrapperAG2PC ThreePartyHandshake StatefulSocket TLSSocket Messaging SSL SSLBuffer NoBuffer CounterType)
+set(SSLTARGETS Util EmpWrapper EmpWrapperAG2PC ThreePartyHandshake StatefulSocket TLSSocket Messaging SSL ThreadSafeSSL EmpSSLSocketManager EmpThreadSocket SSLBuffer NoBuffer CounterType)
 set(NodeTARGETS Server KeyShare)
 set(MTATARGETS MtA F2128MtA EmpBlockOwningSpan EmpBlockNonOwningSpan EmpBlockArray ectf PackArray)
 set(2PCTARGETS CircuitSynthesis)
